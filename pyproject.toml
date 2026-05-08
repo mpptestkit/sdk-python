@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mpp-test-sdk"
+version = "1.1.0"
+description = "Test pay-per-request APIs on Solana — devnet, testnet, or mainnet"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+keywords = ["solana", "mpp", "http402", "payments", "testing"]
+dependencies = [
+    "httpx>=0.27.0",
+    "solders>=0.21.0",
+]
+
+[project.optional-dependencies]
+flask = ["flask>=3.0.0"]
+fastapi = ["fastapi>=0.111.0", "starlette>=0.37.0"]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-mock>=3.14.0",
+    "respx>=0.21.0",
+    "flask>=3.0.0",
+    "fastapi>=0.111.0",
+    "httpx>=0.27.0",
+]
+
+[project.urls]
+Homepage = "https://mpptestkit.com"
+Repository = "https://github.com/mpptestkit/mpptestkit"
+
+[tool.hatch.build.targets.wheel]
+packages = ["mpp_test_sdk"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_classes = ["Test*"]
+filterwarnings = ["ignore::pytest.PytestCollectionWarning"]
