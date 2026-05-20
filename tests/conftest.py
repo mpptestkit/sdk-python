@@ -1,7 +1,7 @@
 """
 Shared pytest fixtures for the MPP Python SDK test suite.
 
-All network calls (httpx + Solana JSON-RPC) are mocked — no real network
+All network calls (httpx + Solana JSON-RPC) are mocked -no real network
 traffic is issued during the test run.
 """
 
@@ -86,7 +86,7 @@ def mock_rpc(mocker: Any) -> Any:
     - ``getLatestBlockhash``   → ``FAKE_BLOCKHASH``
     - ``sendTransaction``      → ``FAKE_SIG``
     """
-    async def _default_rpc(rpc_url: str, method: str, params: list) -> Any:  # noqa: ARG001
+    async def _default_rpc(_self: Any, method: str, params: list) -> Any:  # noqa: ARG001
         match method:
             case "requestAirdrop":
                 return FAKE_AIRDROP_SIG
@@ -102,7 +102,7 @@ def mock_rpc(mocker: Any) -> Any:
                 return None
 
     return mocker.patch(
-        "mpp_test_sdk._client._rpc_call",
+        "mpp_test_sdk._rpc.RpcClient.call",
         side_effect=_default_rpc,
     )
 
@@ -113,15 +113,15 @@ def mock_server_rpc(mocker: Any) -> Any:
     Patch ``mpp_test_sdk._server._rpc_call`` (used by ``_verify_payment``).
 
     Default: returns a valid transaction for *SERVER_ADDRESS* with 2_000_000
-    lamports received — sufficient for a ``"0.001"`` SOL check.
+    lamports received -sufficient for a ``"0.001"`` SOL check.
     """
-    async def _default_rpc(rpc_url: str, method: str, params: list) -> Any:  # noqa: ARG001
+    async def _default_rpc(_self: Any, method: str, params: list) -> Any:  # noqa: ARG001
         if method == "getTransaction":
             return build_fake_tx(SERVER_ADDRESS, received_lamports=2_000_000)
         return None
 
     return mocker.patch(
-        "mpp_test_sdk._server._rpc_call",
+        "mpp_test_sdk._rpc.RpcClient.call",
         side_effect=_default_rpc,
     )
 

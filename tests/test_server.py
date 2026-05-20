@@ -1,5 +1,5 @@
 """
-Tests for mpp_test_sdk._server — MppServer, create_test_server, _verify_payment.
+Tests for mpp_test_sdk._server -MppServer, create_test_server, _verify_payment.
 
 All Solana RPC calls are intercepted.
 Flask and FastAPI adapters are exercised with lightweight in-process test clients.
@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from mpp_test_sdk import TestServerConfig, create_test_server
+from mpp_test_sdk._rpc import RpcClient
 from mpp_test_sdk._server import MppServer, _verify_payment
 
 from .conftest import (
@@ -39,7 +40,7 @@ def make_server(recipient: str = SERVER_ADDRESS) -> MppServer:
     return MppServer(
         recipient_address=recipient,
         network="devnet",
-        rpc_url=RPC_URL,
+        rpc=RpcClient(RPC_URL),
     )
 
 
@@ -49,7 +50,7 @@ def make_server(recipient: str = SERVER_ADDRESS) -> MppServer:
 @pytest.mark.asyncio
 async def test_no_receipt_returns_false_missing_signature() -> None:
     """Empty receipt → (False, 'missing signature') without any RPC call."""
-    ok, msg = await _verify_payment(RPC_URL, "", SERVER_ADDRESS, REQUIRED_SOL)
+    ok, msg = await _verify_payment(make_server()._rpc, "", SERVER_ADDRESS, REQUIRED_SOL)
     assert not ok
     assert "signature" in msg.lower()
 
@@ -75,7 +76,9 @@ def test_payment_required_body_structure() -> None:
 async def test_verify_missing_signature() -> None:
     """Receipt without signature field → (False, message mentioning 'signature')."""
     receipt = 'solana; network="devnet"; amount="0.001"'
-    ok, msg = await _verify_payment(RPC_URL, receipt, SERVER_ADDRESS, REQUIRED_SOL)
+    ok, msg = await _verify_payment(
+        make_server()._rpc, receipt, SERVER_ADDRESS, REQUIRED_SOL
+    )
     assert not ok
     assert "signature" in msg.lower()
 
@@ -86,9 +89,8 @@ async def test_verify_missing_signature() -> None:
 @pytest.mark.asyncio
 async def test_verify_insufficient_claimed_amount(mocker: Any) -> None:
     """Claimed 0.0001 SOL but 0.001 required → Insufficient."""
-    # We don't even need RPC for this — amount check happens first
     receipt = f'solana; signature="{FAKE_SIG}"; network="devnet"; amount="0.0001"'
-    ok, msg = await _verify_payment(RPC_URL, receipt, SERVER_ADDRESS, 0.001)
+    ok, msg = await _verify_payment(make_server()._rpc, receipt, SERVER_ADDRESS, 0.001)
     assert not ok
     assert "insufficient" in msg.lower() or "0.001" in msg
 
@@ -99,11 +101,11 @@ async def test_verify_insufficient_claimed_amount(mocker: Any) -> None:
 @pytest.mark.asyncio
 async def test_verify_tx_not_found(mocker: Any) -> None:
     """getTransaction returning None → (False, 'not found')."""
-    mocker.patch(
-        "mpp_test_sdk._server._rpc_call",
-        new=AsyncMock(return_value=None),
+    server = make_server()
+    mocker.patch.object(server._rpc, "call", new=AsyncMock(return_value=None))
+    ok, msg = await _verify_payment(
+        server._rpc, RECEIPT_EXACT, SERVER_ADDRESS, REQUIRED_SOL
     )
-    ok, msg = await _verify_payment(RPC_URL, RECEIPT_EXACT, SERVER_ADDRESS, REQUIRED_SOL)
     assert not ok
     assert "not found" in msg.lower()
 
@@ -114,11 +116,15 @@ async def test_verify_tx_not_found(mocker: Any) -> None:
 @pytest.mark.asyncio
 async def test_verify_tx_has_error(mocker: Any) -> None:
     """Transaction with meta.err → (False, 'failed on chain')."""
-    mocker.patch(
-        "mpp_test_sdk._server._rpc_call",
+    server = make_server()
+    mocker.patch.object(
+        server._rpc,
+        "call",
         new=AsyncMock(return_value=build_fake_tx(SERVER_ADDRESS, failed=True)),
     )
-    ok, msg = await _verify_payment(RPC_URL, RECEIPT_EXACT, SERVER_ADDRESS, REQUIRED_SOL)
+    ok, msg = await _verify_payment(
+        server._rpc, RECEIPT_EXACT, SERVER_ADDRESS, REQUIRED_SOL
+    )
     assert not ok
     assert "failed on chain" in msg.lower()
 
@@ -130,11 +136,13 @@ async def test_verify_tx_has_error(mocker: Any) -> None:
 async def test_verify_recipient_not_in_tx(mocker: Any) -> None:
     """Transaction paying a different address → (False, 'not found in transaction')."""
     other = "SomeOtherRecipient11111111111111111111111"
-    mocker.patch(
-        "mpp_test_sdk._server._rpc_call",
-        new=AsyncMock(return_value=build_fake_tx(other)),
+    server = make_server()
+    mocker.patch.object(
+        server._rpc, "call", new=AsyncMock(return_value=build_fake_tx(other))
     )
-    ok, msg = await _verify_payment(RPC_URL, RECEIPT_EXACT, SERVER_ADDRESS, REQUIRED_SOL)
+    ok, msg = await _verify_payment(
+        server._rpc, RECEIPT_EXACT, SERVER_ADDRESS, REQUIRED_SOL
+    )
     assert not ok
     assert "not found in transaction" in msg.lower()
 
@@ -145,13 +153,15 @@ async def test_verify_recipient_not_in_tx(mocker: Any) -> None:
 @pytest.mark.asyncio
 async def test_verify_received_too_small(mocker: Any) -> None:
     """Only 100 lamports received but 1_000_000 required → too small."""
-    mocker.patch(
-        "mpp_test_sdk._server._rpc_call",
-        new=AsyncMock(
-            return_value=build_fake_tx(SERVER_ADDRESS, received_lamports=100)
-        ),
+    server = make_server()
+    mocker.patch.object(
+        server._rpc,
+        "call",
+        new=AsyncMock(return_value=build_fake_tx(SERVER_ADDRESS, received_lamports=100)),
     )
-    ok, msg = await _verify_payment(RPC_URL, RECEIPT_EXACT, SERVER_ADDRESS, REQUIRED_SOL)
+    ok, msg = await _verify_payment(
+        server._rpc, RECEIPT_EXACT, SERVER_ADDRESS, REQUIRED_SOL
+    )
     assert not ok
     assert "too small" in msg.lower()
 
@@ -162,13 +172,17 @@ async def test_verify_received_too_small(mocker: Any) -> None:
 @pytest.mark.asyncio
 async def test_verify_exact_payment_ok(mocker: Any) -> None:
     """Exactly required amount → (True, '')."""
-    mocker.patch(
-        "mpp_test_sdk._server._rpc_call",
+    server = make_server()
+    mocker.patch.object(
+        server._rpc,
+        "call",
         new=AsyncMock(
             return_value=build_fake_tx(SERVER_ADDRESS, received_lamports=1_000_000)
         ),
     )
-    ok, msg = await _verify_payment(RPC_URL, RECEIPT_EXACT, SERVER_ADDRESS, REQUIRED_SOL)
+    ok, msg = await _verify_payment(
+        server._rpc, RECEIPT_EXACT, SERVER_ADDRESS, REQUIRED_SOL
+    )
     assert ok
     assert msg == ""
 
@@ -176,13 +190,17 @@ async def test_verify_exact_payment_ok(mocker: Any) -> None:
 @pytest.mark.asyncio
 async def test_verify_overpayment_ok(mocker: Any) -> None:
     """More than required → (True, '')."""
-    mocker.patch(
-        "mpp_test_sdk._server._rpc_call",
+    server = make_server()
+    mocker.patch.object(
+        server._rpc,
+        "call",
         new=AsyncMock(
             return_value=build_fake_tx(SERVER_ADDRESS, received_lamports=5_000_000)
         ),
     )
-    ok, msg = await _verify_payment(RPC_URL, RECEIPT_HIGH, SERVER_ADDRESS, REQUIRED_SOL)
+    ok, msg = await _verify_payment(
+        server._rpc, RECEIPT_HIGH, SERVER_ADDRESS, REQUIRED_SOL
+    )
     assert ok
     assert msg == ""
 
@@ -258,15 +276,16 @@ async def test_fastapi_charge_valid_payment_200(mocker: Any) -> None:
     from fastapi import Depends, FastAPI  # noqa: PLC0415
     from starlette.testclient import TestClient  # noqa: PLC0415
 
-    mocker.patch(
-        "mpp_test_sdk._server._rpc_call",
+    server = make_server()
+    mocker.patch.object(
+        server._rpc,
+        "call",
         new=AsyncMock(
             return_value=build_fake_tx(SERVER_ADDRESS, received_lamports=1_000_000)
         ),
     )
 
     app = FastAPI()
-    server = make_server()
 
     @app.get("/api/data")
     async def data(dep: None = Depends(server.charge("0.001"))) -> dict:
@@ -285,7 +304,7 @@ async def test_fastapi_charge_valid_payment_200(mocker: Any) -> None:
 def test_custom_recipient_address_in_header() -> None:
     """MppServer respects a custom recipient_address in the Payment-Request header."""
     custom = "CustomRecip111111111111111111111111111111"
-    server = MppServer(recipient_address=custom, network="devnet", rpc_url=RPC_URL)
+    server = MppServer(recipient_address=custom, network="devnet", rpc=RpcClient(RPC_URL))
     assert server.recipient_address == custom
     header = server._payment_request_header("0.001")
     assert f'recipient="{custom}"' in header

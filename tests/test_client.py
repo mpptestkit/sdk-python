@@ -1,5 +1,5 @@
 """
-Tests for mpp_test_sdk._client — create_test_client, TestClient.fetch, mpp_fetch.
+Tests for mpp_test_sdk._client -create_test_client, TestClient.fetch, mpp_fetch.
 
 Strategy:
 - Patch ``mpp_test_sdk._client._airdrop_with_retry`` so no real RPC calls are made.
@@ -29,6 +29,7 @@ from mpp_test_sdk._client import (
     mpp_fetch,
     mpp_fetch_reset,
 )
+from mpp_test_sdk._rpc import NETWORK_RPC, RpcClient
 from mpp_test_sdk.errors import (
     MppFaucetError,
     MppNetworkError,
@@ -52,19 +53,20 @@ def make_client(
     timeout: float = 30.0,
     on_step=None,
 ) -> TestClient:
-    """Build a TestClient backed by a FakeKeypair — no solders needed."""
+    """Build a TestClient backed by a FakeKeypair -no solders needed."""
     kp = FakeKeypair(FAKE_ADDRESS)
     return TestClient(
         address=FAKE_ADDRESS,
         network=network,  # type: ignore[arg-type]
         keypair=kp,
-        rpc_url=_client_mod.NETWORK_RPC[network],
+        rpc=RpcClient(NETWORK_RPC[network], timeout=timeout),
+        http=httpx.AsyncClient(timeout=timeout),
         on_step=on_step or (lambda _: None),
         timeout=timeout,
     )
 
 
-# ─── 1. create_test_client devnet — keypair generated, returns TestClient ──────
+# ─── 1. create_test_client devnet -keypair generated, returns TestClient ──────
 
 
 @pytest.mark.asyncio
@@ -95,7 +97,7 @@ async def test_create_client_devnet_defaults() -> None:
     airdrop_mock.assert_called_once()
 
 
-# ─── 2. create_test_client with secret_key — uses provided key ────────────────
+# ─── 2. create_test_client with secret_key -uses provided key ────────────────
 
 
 @pytest.mark.asyncio
@@ -145,7 +147,7 @@ async def test_create_client_mainnet_error_mentions_secret_key() -> None:
     assert "secret_key" in msg
 
 
-# ─── 4. create_test_client testnet — airdrop called ──────────────────────────
+# ─── 4. create_test_client testnet -airdrop called ──────────────────────────
 
 
 @pytest.mark.asyncio
@@ -382,28 +384,27 @@ async def test_fetch_402_invalid_amount_raises() -> None:
     assert exc_info.value.status == 402
 
 
-# ─── 12. airdrop retry — first 2 fail, 3rd succeeds ─────────────────────────
+# ─── 12. airdrop retry -first 2 fail, 3rd succeeds ─────────────────────────
 
 
 @pytest.mark.asyncio
 async def test_airdrop_retry_succeeds_on_third() -> None:
     """_airdrop_with_retry: first 2 attempts raise, 3rd succeeds."""
     call_count = 0
+    rpc = RpcClient("https://api.devnet.solana.com")
 
-    async def flaky(rpc_url: str, method: str, params: list) -> Any:
+    async def flaky(_self: RpcClient, method: str, params: list) -> Any:  # noqa: ARG001
         nonlocal call_count
         if method == "requestAirdrop":
             call_count += 1
             if call_count < 3:
                 raise RuntimeError("rate limited")
             return "ok_sig"
-        # getSignatureStatuses
         return {"value": [{"confirmationStatus": "confirmed", "err": None}]}
 
-    # Patch sleep to be instant
     with patch("asyncio.sleep", AsyncMock()):
-        with patch("mpp_test_sdk._client._rpc_call", side_effect=flaky):
-            await _airdrop_with_retry("https://api.devnet.solana.com", FAKE_ADDRESS)
+        with patch.object(RpcClient, "call", flaky):
+            await _airdrop_with_retry(rpc, FAKE_ADDRESS)
 
     assert call_count == 3
 
@@ -414,17 +415,17 @@ async def test_airdrop_retry_succeeds_on_third() -> None:
 @pytest.mark.asyncio
 async def test_airdrop_all_retries_fail() -> None:
     """_airdrop_with_retry: 3 consecutive failures → MppFaucetError."""
-    async def always_fail(rpc_url: str, method: str, params: list) -> Any:
+    rpc = RpcClient("https://api.devnet.solana.com")
+
+    async def always_fail(_self: RpcClient, method: str, params: list) -> Any:  # noqa: ARG001
         if method == "requestAirdrop":
             raise RuntimeError("rate limit")
         return {"value": [{"confirmationStatus": "confirmed", "err": None}]}
 
     with patch("asyncio.sleep", AsyncMock()):
-        with patch("mpp_test_sdk._client._rpc_call", side_effect=always_fail):
+        with patch.object(RpcClient, "call", always_fail):
             with pytest.raises(MppFaucetError) as exc_info:
-                await _airdrop_with_retry(
-                    "https://api.devnet.solana.com", FAKE_ADDRESS
-                )
+                await _airdrop_with_retry(rpc, FAKE_ADDRESS)
 
     assert exc_info.value.address == FAKE_ADDRESS
 
