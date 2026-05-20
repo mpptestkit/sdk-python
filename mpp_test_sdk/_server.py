@@ -1,54 +1,28 @@
 """
-MPP server middleware — HTTP 402 gating with on-chain Solana verification.
+MPP server middleware -HTTP 402 gating with on-chain Solana verification.
 
 Supports both **Flask** and **FastAPI** / Starlette.
-
-Usage (Flask)::
-
-    from flask import Flask
-    from mpp_test_sdk import create_test_server
-
-    app = Flask(__name__)
-    mpp = create_test_server()
-
-    @app.get("/api/data")
-    @mpp.flask_charge("0.001")
-    def data():
-        return {"data": "premium content"}
-
-Usage (FastAPI)::
-
-    from fastapi import FastAPI, Depends
-    from mpp_test_sdk import create_test_server
-
-    app = FastAPI()
-    mpp = create_test_server()
-
-    @app.get("/api/data")
-    async def data(dep=Depends(mpp.charge("0.001"))):
-        return {"data": "premium content"}
 """
 
 from __future__ import annotations
 
 import asyncio
 import functools
-import inspect
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from ._client import LAMPORTS_PER_SOL, NETWORK_RPC, SolanaNetwork, _parse_header_params, _rpc_call
+from ._rpc import (
+    LAMPORTS_PER_SOL,
+    NETWORK_RPC,
+    RpcClient,
+    SolanaNetwork,
+    parse_header_params,
+)
 
-# Attempt a top-level import of starlette.requests.Request so that FastAPI's
-# dependency-injection engine can resolve the annotation without string-eval.
 try:
-    from starlette.requests import Request as _StarletteRequest  # noqa: TCH002
-    _HAS_STARLETTE = True
+    from starlette.requests import Request as _StarletteRequest
 except ImportError:  # pragma: no cover
     _StarletteRequest = Any  # type: ignore[assignment,misc]
-    _HAS_STARLETTE = False
-
-# ─── Config ───────────────────────────────────────────────────────────────────
 
 
 @dataclass
@@ -77,11 +51,8 @@ class TestServerConfig:
     rpc_url: str | None = None
 
 
-# ─── Payment verification ─────────────────────────────────────────────────────
-
-
 async def _verify_payment(
-    rpc_url: str,
+    rpc: RpcClient,
     receipt_header: str,
     recipient_address: str,
     required_sol: float,
@@ -89,10 +60,9 @@ async def _verify_payment(
     """
     Verify an on-chain SOL payment described by *receipt_header*.
 
-    Returns a ``(success, error_message)`` tuple.  On success *error_message*
-    is an empty string.
+    Returns ``(success, error_message)``.  On success *error_message* is empty.
     """
-    params = _parse_header_params(receipt_header)
+    params = parse_header_params(receipt_header)
     sig = params.get("signature")
     if not sig:
         return False, "Payment-Receipt missing signature"
@@ -109,8 +79,7 @@ async def _verify_payment(
             f"required {required_sol} SOL",
         )
 
-    tx = await _rpc_call(
-        rpc_url,
+    tx = await rpc.call(
         "getTransaction",
         [
             sig,
@@ -147,25 +116,16 @@ async def _verify_payment(
     return True, ""
 
 
-# ─── FastAPI dependency factory ───────────────────────────────────────────────
-
-
 def _make_fastapi_dependency(
     *,
-    rpc_url: str,
+    rpc: RpcClient,
     recipient: str,
     network: str,
     required_sol: float,
     amount: str,
     payment_request_hdr: str,
 ) -> Callable:
-    """
-    Build a FastAPI-compatible async dependency function with a concrete
-    ``starlette.requests.Request`` annotation so the DI engine injects it.
-
-    This is a module-level factory (not a method) so the annotation refers to
-    the module-level ``_StarletteRequest`` name which is always resolvable.
-    """
+    """Build a FastAPI dependency with a concrete ``Request`` annotation."""
     try:
         from starlette.exceptions import HTTPException  # noqa: PLC0415
     except ImportError:
@@ -183,7 +143,7 @@ def _make_fastapi_dependency(
 
         try:
             ok, err_msg = await _verify_payment(
-                rpc_url, receipt_header, recipient, required_sol
+                rpc, receipt_header, recipient, required_sol
             )
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(
@@ -197,36 +157,22 @@ def _make_fastapi_dependency(
     return dependency
 
 
-# ─── MppServer ────────────────────────────────────────────────────────────────
-
-
 class MppServer:
     """
     MPP server helper that issues 402 challenges and verifies on-chain payments.
 
     Provides framework-specific decorators/dependencies for Flask and FastAPI.
-
-    Do not instantiate directly; use :func:`create_test_server` instead.
-
-    Attributes
-    ----------
-    recipient_address:
-        Base58 Solana address where payments are sent.
-    network:
-        Solana network this server is configured for.
     """
 
     def __init__(
         self,
         recipient_address: str,
         network: SolanaNetwork,
-        rpc_url: str,
+        rpc: RpcClient,
     ) -> None:
         self.recipient_address: str = recipient_address
         self.network: SolanaNetwork = network
-        self._rpc_url: str = rpc_url
-
-    # ─── Internal ─────────────────────────────────────────────────────────────
+        self._rpc = rpc
 
     def _payment_request_header(self, amount: str) -> str:
         return (
@@ -246,30 +192,12 @@ class MppServer:
             },
         }
 
-    # ─── Flask ────────────────────────────────────────────────────────────────
-
     def flask_charge(self, amount: str) -> Callable:
         """
         Flask decorator that enforces SOL payment before the route handler runs.
-
-        - **No receipt** → 402 with ``Payment-Request`` header.
-        - **Valid receipt + on-chain confirmation** → handler is called normally.
-        - **Invalid or insufficient payment** → 403.
-
-        Parameters
-        ----------
-        amount:
-            Required SOL amount as a string, e.g. ``"0.001"``.
-
-        Examples
-        --------
-        ::
-
-            @app.get("/api/data")
-            @mpp.flask_charge("0.001")
-            def data():
-                return jsonify({"data": "premium"})
         """
+        required_sol = float(amount)
+
         def decorator(fn: Callable) -> Callable:
             @functools.wraps(fn)
             def wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -280,23 +208,20 @@ class MppServer:
                 if not receipt_header:
                     response = jsonify(self._payment_required_body(amount))
                     response.status_code = 402
-                    response.headers["Payment-Request"] = self._payment_request_header(amount)
+                    response.headers["Payment-Request"] = self._payment_request_header(
+                        amount
+                    )
                     return response
 
-                # Verify on-chain
                 try:
-                    loop = asyncio.new_event_loop()
-                    try:
-                        ok, err_msg = loop.run_until_complete(
-                            _verify_payment(
-                                self._rpc_url,
-                                receipt_header,
-                                self.recipient_address,
-                                float(amount),
-                            )
+                    ok, err_msg = asyncio.run(
+                        _verify_payment(
+                            self._rpc,
+                            receipt_header,
+                            self.recipient_address,
+                            required_sol,
                         )
-                    finally:
-                        loop.close()
+                    )
                 except Exception as exc:  # noqa: BLE001
                     response = jsonify({"error": f"Payment verification failed: {exc}"})
                     response.status_code = 403
@@ -307,72 +232,30 @@ class MppServer:
                     response.status_code = 403
                     return response
 
-                # Payment verified — call the actual route handler
                 if asyncio.iscoroutinefunction(fn):
-                    loop2 = asyncio.new_event_loop()
-                    try:
-                        return loop2.run_until_complete(fn(*args, **kwargs))
-                    finally:
-                        loop2.close()
+                    return asyncio.run(fn(*args, **kwargs))
                 return fn(*args, **kwargs)
 
             return wrapper
 
         return decorator
 
-    # ─── FastAPI ──────────────────────────────────────────────────────────────
-
     def fastapi_charge(self, amount: str) -> Callable:
-        """
-        FastAPI dependency that enforces SOL payment.
-
-        Use with ``Depends``::
-
-            @app.get("/api/data")
-            async def data(dep=Depends(mpp.fastapi_charge("0.001"))):
-                return {"data": "premium"}
-
-        - **No receipt** → raises ``HTTPException(402)`` with ``Payment-Request``
-          header.
-        - **Valid receipt + on-chain confirmation** → dependency resolves.
-        - **Invalid or insufficient payment** → raises ``HTTPException(403)``.
-
-        Parameters
-        ----------
-        amount:
-            Required SOL amount as a string, e.g. ``"0.001"``.
-        """
-        rpc_url = self._rpc_url
-        recipient = self.recipient_address
-        network = self.network
+        """FastAPI dependency that enforces SOL payment."""
         required_sol = float(amount)
         payment_request_hdr = self._payment_request_header(amount)
 
-        # Build the dependency with a concrete starlette Request annotation so
-        # FastAPI's dependency-injection engine can recognise it.  We create the
-        # function inside a helper that captures the correct annotation at call
-        # time rather than relying on a forward-reference string.
-        dep = _make_fastapi_dependency(
-            rpc_url=rpc_url,
-            recipient=recipient,
-            network=network,
+        return _make_fastapi_dependency(
+            rpc=self._rpc,
+            recipient=self.recipient_address,
+            network=self.network,
             required_sol=required_sol,
             amount=amount,
             payment_request_hdr=payment_request_hdr,
         )
-        return dep
 
     def charge(self, amount: str) -> Callable:
-        """
-        Alias for :meth:`fastapi_charge` — the most common use case.
-
-        For Flask routes use :meth:`flask_charge` instead.
-
-        Parameters
-        ----------
-        amount:
-            Required SOL amount as a string, e.g. ``"0.001"``.
-        """
+        """Alias for :meth:`fastapi_charge`."""
         return self.fastapi_charge(amount)
 
 
@@ -390,52 +273,8 @@ def _payment_required_detail(
     }
 
 
-# ─── create_test_server ───────────────────────────────────────────────────────
-
-
 def create_test_server(config: TestServerConfig | None = None) -> MppServer:
-    """
-    Create a Solana MPP-enabled server helper.
-
-    Auto-generates a server wallet if no *secret_key* is provided.
-
-    Parameters
-    ----------
-    config:
-        Optional :class:`TestServerConfig`.  Defaults to devnet with an
-        auto-generated keypair.
-
-    Returns
-    -------
-    MppServer
-
-    Examples
-    --------
-    Flask::
-
-        from flask import Flask
-        from mpp_test_sdk import create_test_server
-
-        app = Flask(__name__)
-        mpp = create_test_server()
-
-        @app.get("/api/data")
-        @mpp.flask_charge("0.001")
-        def data():
-            return {"data": "premium"}
-
-    FastAPI::
-
-        from fastapi import FastAPI, Depends
-        from mpp_test_sdk import create_test_server
-
-        app = FastAPI()
-        mpp = create_test_server()
-
-        @app.get("/api/data")
-        async def data(dep=Depends(mpp.charge("0.001"))):
-            return {"data": "premium"}
-    """
+    """Create a Solana MPP-enabled server helper."""
     from solders.keypair import Keypair  # noqa: PLC0415
 
     cfg = config or TestServerConfig()
@@ -452,5 +291,5 @@ def create_test_server(config: TestServerConfig | None = None) -> MppServer:
     return MppServer(
         recipient_address=recipient_address,
         network=network,
-        rpc_url=rpc_url,
+        rpc=RpcClient(rpc_url),
     )

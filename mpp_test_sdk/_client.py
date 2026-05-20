@@ -1,11 +1,11 @@
 """
-MPP test client — automatic HTTP 402 / Solana payment handling.
+MPP test client -automatic HTTP 402 / Solana payment handling.
 
 Usage::
 
     from mpp_test_sdk import create_test_client, mpp_fetch, mpp_fetch_reset
 
-    # devnet (default) — zero config
+    # devnet (default) -zero config
     client = await create_test_client()
     res = await client.fetch("http://localhost:3001/api/data")
 
@@ -23,24 +23,16 @@ from typing import Any, Callable, Literal
 
 import httpx
 
+from ._rpc import (
+    LAMPORTS_PER_SOL,
+    NETWORK_RPC,
+    RpcClient,
+    SolanaNetwork,
+    parse_header_params,
+)
 from .errors import MppFaucetError, MppNetworkError, MppPaymentError, MppTimeoutError
 
-# ─── Constants ────────────────────────────────────────────────────────────────
-
-LAMPORTS_PER_SOL: int = 1_000_000_000
-
-SolanaNetwork = Literal["devnet", "testnet", "mainnet"]
-
-NETWORK_RPC: dict[str, str] = {
-    "devnet": "https://api.devnet.solana.com",
-    "testnet": "https://api.testnet.solana.com",
-    "mainnet": "https://api.mainnet-beta.solana.com",
-}
-
-_AIRDROP_NETWORKS: set[str] = {"devnet", "testnet"}
-
-# ─── Data types ───────────────────────────────────────────────────────────────
-
+_AIRDROP_NETWORKS: frozenset[str] = frozenset({"devnet", "testnet"})
 
 @dataclass
 class PaymentStep:
@@ -95,9 +87,6 @@ class TestClientConfig:
     rpc_url: str | None = None
 
 
-# ─── TestClient ───────────────────────────────────────────────────────────────
-
-
 class TestClient:
     """
     An MPP-enabled async HTTP client backed by a Solana wallet.
@@ -119,8 +108,9 @@ class TestClient:
         address: str,
         network: SolanaNetwork,
         *,
-        keypair: Any,  # solders Keypair
-        rpc_url: str,
+        keypair: Any,
+        rpc: RpcClient,
+        http: httpx.AsyncClient,
         on_step: Callable[[PaymentStep], None],
         timeout: float,
     ) -> None:
@@ -128,9 +118,15 @@ class TestClient:
         self.network: SolanaNetwork = network
         self.method: Literal["solana"] = "solana"
         self._keypair = keypair
-        self._rpc_url = rpc_url
+        self._rpc = rpc
+        self._http = http
         self._on_step = on_step
         self._timeout = timeout
+
+    async def aclose(self) -> None:
+        """Close underlying HTTP and RPC connections."""
+        await self._http.aclose()
+        await self._rpc.aclose()
 
     async def fetch(self, url: str, **kwargs: Any) -> httpx.Response:
         """
@@ -172,185 +168,134 @@ class TestClient:
             raise MppTimeoutError(url, timeout_ms) from exc
 
     async def _fetch_inner(self, url: str, **kwargs: Any) -> httpx.Response:
-        """Inner fetch without the timeout wrapper."""
         emit = self._on_step
         emit(PaymentStep(type="request", message=f"→ {url}", data={"url": url}))
 
         http_method: str = kwargs.pop("method", "GET").upper()
         headers: dict[str, str] = dict(kwargs.pop("headers", {}))
 
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            # Step 1: initial request
-            res = await client.request(
-                http_method, url, headers=headers, **kwargs
-            )
+        res = await self._http.request(http_method, url, headers=headers, **kwargs)
 
-            # Non-402 path
-            if res.status_code != 402:
-                if not res.is_success:
-                    emit(
-                        PaymentStep(
-                            type="error",
-                            message=f"← {res.status_code} {res.reason_phrase}",
-                            data={"status": res.status_code},
-                        )
-                    )
-                    raise MppPaymentError(url, res.status_code)
+        if res.status_code != 402:
+            if not res.is_success:
                 emit(
                     PaymentStep(
-                        type="success",
-                        message=f"← {res.status_code} OK",
+                        type="error",
+                        message=f"← {res.status_code} {res.reason_phrase}",
                         data={"status": res.status_code},
                     )
                 )
-                return res
-
-            # Step 2: parse Payment-Request header
-            payment_request_header = res.headers.get("payment-request", "")
-            if not payment_request_header:
-                raise MppPaymentError(
-                    url,
-                    402,
-                    ValueError("Server returned 402 without Payment-Request header"),
-                )
-
-            params = _parse_header_params(payment_request_header)
-
-            if not params.get("recipient"):
-                raise MppPaymentError(
-                    url,
-                    402,
-                    ValueError("Payment-Request header missing recipient field"),
-                )
-            if not params.get("amount"):
-                raise MppPaymentError(
-                    url,
-                    402,
-                    ValueError("Payment-Request header missing amount field"),
-                )
-
-            try:
-                amount_sol = float(params["amount"])
-                if amount_sol <= 0:
-                    raise ValueError(f"Invalid payment amount: {params['amount']}")
-            except (ValueError, TypeError) as exc:
-                raise MppPaymentError(
-                    url,
-                    402,
-                    ValueError(f"Invalid payment amount: {params.get('amount')}"),
-                ) from exc
-
-            lamports = round(amount_sol * LAMPORTS_PER_SOL)
-            recipient_str: str = params["recipient"]
-
+                raise MppPaymentError(url, res.status_code)
             emit(
                 PaymentStep(
-                    type="payment",
-                    message=f"Paying {amount_sol} SOL → {recipient_str[:8]}...",
-                    data={"amount": amount_sol, "recipient": recipient_str},
+                    type="success",
+                    message=f"← {res.status_code} OK",
+                    data={"status": res.status_code},
                 )
             )
+            return res
 
-            # Step 3: send SOL transfer
-            signature = await _send_sol(
-                self._rpc_url, self._keypair, recipient_str, lamports
+        payment_request_header = res.headers.get("payment-request", "")
+        if not payment_request_header:
+            raise MppPaymentError(
+                url,
+                402,
+                ValueError("Server returned 402 without Payment-Request header"),
             )
 
-            emit(
-                PaymentStep(
-                    type="payment",
-                    message=f"Confirmed: {signature[:16]}...",
-                    data={"signature": signature, "amount": amount_sol},
-                )
+        params = parse_header_params(payment_request_header)
+
+        if not params.get("recipient"):
+            raise MppPaymentError(
+                url,
+                402,
+                ValueError("Payment-Request header missing recipient field"),
+            )
+        if not params.get("amount"):
+            raise MppPaymentError(
+                url,
+                402,
+                ValueError("Payment-Request header missing amount field"),
             )
 
-            # Step 4: retry with Payment-Receipt header
-            emit(
-                PaymentStep(
-                    type="retry",
-                    message="↑ Retrying with payment proof",
-                    data={"signature": signature},
-                )
+        try:
+            amount_sol = float(params["amount"])
+            if amount_sol <= 0:
+                raise ValueError(f"Invalid payment amount: {params['amount']}")
+        except (ValueError, TypeError) as exc:
+            raise MppPaymentError(
+                url,
+                402,
+                ValueError(f"Invalid payment amount: {params.get('amount')}"),
+            ) from exc
+
+        lamports = round(amount_sol * LAMPORTS_PER_SOL)
+        recipient_str: str = params["recipient"]
+
+        emit(
+            PaymentStep(
+                type="payment",
+                message=f"Paying {amount_sol} SOL → {recipient_str[:8]}...",
+                data={"amount": amount_sol, "recipient": recipient_str},
             )
-
-            receipt_header = (
-                f'solana; signature="{signature}"; '
-                f'network="{self.network}"; '
-                f'amount="{amount_sol}"'
-            )
-            retry_headers = {**headers, "payment-receipt": receipt_header}
-
-            retry_res = await client.request(
-                http_method, url, headers=retry_headers, **kwargs
-            )
-
-            emit(
-                PaymentStep(
-                    type="success" if retry_res.is_success else "error",
-                    message=(
-                        f"← {retry_res.status_code} "
-                        f"{'OK' if retry_res.is_success else retry_res.reason_phrase}"
-                    ),
-                    data={"status": retry_res.status_code, "signature": signature},
-                )
-            )
-
-            return retry_res
-
-
-# ─── JSON-RPC helpers ─────────────────────────────────────────────────────────
-
-
-async def _rpc_call(rpc_url: str, method: str, params: list[Any]) -> Any:
-    """
-    Execute a single Solana JSON-RPC call and return ``result``.
-
-    Raises :class:`RuntimeError` if the response contains an ``error`` field.
-    """
-    async with httpx.AsyncClient(timeout=30) as h:
-        r = await h.post(
-            rpc_url,
-            json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
         )
-        data = r.json()
-        if "error" in data:
-            raise RuntimeError(data["error"]["message"])
-        return data["result"]
 
+        signature = await _send_sol(self._rpc, self._keypair, recipient_str, lamports)
 
-async def _get_latest_blockhash(rpc_url: str) -> str:
-    """Return the latest confirmed blockhash as a base58 string."""
-    result = await _rpc_call(
-        rpc_url, "getLatestBlockhash", [{"commitment": "confirmed"}]
-    )
-    return result["value"]["blockhash"]
-
-
-async def _request_airdrop(rpc_url: str, pubkey_str: str, lamports: int) -> None:
-    """Request a faucet airdrop and poll until confirmed."""
-    sig = await _rpc_call(rpc_url, "requestAirdrop", [pubkey_str, lamports])
-    for _ in range(60):
-        await asyncio.sleep(1)
-        statuses = await _rpc_call(
-            rpc_url, "getSignatureStatuses", [[sig]]
+        emit(
+            PaymentStep(
+                type="payment",
+                message=f"Confirmed: {signature[:16]}...",
+                data={"signature": signature, "amount": amount_sol},
+            )
         )
-        status = statuses["value"][0]
-        if status and status.get("confirmationStatus") in ("confirmed", "finalized"):
-            return
-    raise RuntimeError("Airdrop confirmation timed out")
+
+        emit(
+            PaymentStep(
+                type="retry",
+                message="↑ Retrying with payment proof",
+                data={"signature": signature},
+            )
+        )
+
+        receipt_header = (
+            f'solana; signature="{signature}"; '
+            f'network="{self.network}"; '
+            f'amount="{amount_sol}"'
+        )
+        retry_headers = {**headers, "payment-receipt": receipt_header}
+
+        retry_res = await self._http.request(
+            http_method, url, headers=retry_headers, **kwargs
+        )
+
+        emit(
+            PaymentStep(
+                type="success" if retry_res.is_success else "error",
+                message=(
+                    f"← {retry_res.status_code} "
+                    f"{'OK' if retry_res.is_success else retry_res.reason_phrase}"
+                ),
+                data={"status": retry_res.status_code, "signature": signature},
+            )
+        )
+
+        return retry_res
+
+
+async def _request_airdrop(rpc: RpcClient, pubkey_str: str, lamports: int) -> None:
+    """Request a faucet airdrop and wait until confirmed."""
+    sig = await rpc.call("requestAirdrop", [pubkey_str, lamports])
+    await rpc.wait_for_signature(sig)
 
 
 async def _send_sol(
-    rpc_url: str,
-    keypair: Any,  # solders Keypair
+    rpc: RpcClient,
+    keypair: Any,
     recipient_str: str,
     lamports: int,
 ) -> str:
-    """
-    Build and submit a SOL transfer transaction.
-
-    Returns the transaction signature string after on-chain confirmation.
-    """
+    """Build, submit, and confirm a SOL transfer. Returns the transaction signature."""
     from solders.hash import Hash  # noqa: PLC0415
     from solders.message import Message  # noqa: PLC0415
     from solders.pubkey import Pubkey  # noqa: PLC0415
@@ -358,38 +303,29 @@ async def _send_sol(
     from solders.transaction import Transaction  # noqa: PLC0415
 
     recipient = Pubkey.from_string(recipient_str)
-    blockhash_str = await _get_latest_blockhash(rpc_url)
-    blockhash = Hash.from_string(blockhash_str)
+    blockhash = Hash.from_string(await rpc.get_latest_blockhash())
 
-    ix = transfer(TransferParams(from_pubkey=keypair.pubkey(), to_pubkey=recipient, lamports=lamports))
+    ix = transfer(
+        TransferParams(
+            from_pubkey=keypair.pubkey(),
+            to_pubkey=recipient,
+            lamports=lamports,
+        )
+    )
     msg = Message([ix], keypair.pubkey())
     tx = Transaction([keypair], msg, blockhash)
 
     raw_b64 = base64.b64encode(bytes(tx)).decode()
-    sig = await _rpc_call(
-        rpc_url,
+    sig = await rpc.call(
         "sendTransaction",
         [raw_b64, {"encoding": "base64", "preflightCommitment": "confirmed"}],
     )
-
-    # Poll for confirmation
-    for _ in range(60):
-        await asyncio.sleep(1)
-        statuses = await _rpc_call(rpc_url, "getSignatureStatuses", [[sig]])
-        status = statuses["value"][0]
-        if status and status.get("confirmationStatus") in ("confirmed", "finalized"):
-            if status.get("err"):
-                raise RuntimeError("Transaction failed on chain")
-            return sig
-
-    raise RuntimeError("Transaction confirmation timed out")
-
-
-# ─── Airdrop with retry ───────────────────────────────────────────────────────
+    await rpc.wait_for_signature(sig)
+    return sig
 
 
 async def _airdrop_with_retry(
-    rpc_url: str,
+    rpc: RpcClient,
     pubkey_str: str,
     retries: int = 3,
 ) -> None:
@@ -401,39 +337,13 @@ async def _airdrop_with_retry(
     last_exc: BaseException | None = None
     for attempt in range(retries):
         try:
-            await _request_airdrop(rpc_url, pubkey_str, 2 * LAMPORTS_PER_SOL)
+            await _request_airdrop(rpc, pubkey_str, 2 * LAMPORTS_PER_SOL)
             return
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
             if attempt < retries - 1:
-                await asyncio.sleep(2**attempt)  # 1s, 2s, 4s
+                await asyncio.sleep(2**attempt)
     raise MppFaucetError(pubkey_str, last_exc)
-
-
-# ─── Header parsing ───────────────────────────────────────────────────────────
-
-
-def _parse_header_params(header: str) -> dict[str, str]:
-    """
-    Parse a structured HTTP header value of the form::
-
-        solana; key1="val1"; key2="val2"
-
-    Returns a dict of lowercase key → unquoted value pairs (the scheme token
-    itself is skipped).
-    """
-    params: dict[str, str] = {}
-    parts = [p.strip() for p in header.split(";")]
-    for part in parts[1:]:
-        eq_idx = part.find("=")
-        if eq_idx > 0:
-            key = part[:eq_idx].strip().lower()
-            val = part[eq_idx + 1 :].strip().strip('"')
-            params[key] = val
-    return params
-
-
-# ─── create_test_client ───────────────────────────────────────────────────────
 
 
 async def create_test_client(config: TestClientConfig | None = None) -> TestClient:
@@ -443,40 +353,6 @@ async def create_test_client(config: TestClientConfig | None = None) -> TestClie
     Automatically creates a Solana wallet, funds it (via airdrop on
     devnet/testnet), and returns a :class:`TestClient` whose
     :meth:`~TestClient.fetch` method handles HTTP 402 MPP payments.
-
-    Parameters
-    ----------
-    config:
-        Optional :class:`TestClientConfig`.  Defaults to devnet with an
-        auto-generated keypair.
-
-    Returns
-    -------
-    TestClient
-
-    Raises
-    ------
-    MppNetworkError:
-        When ``"mainnet"`` is specified without a *secret_key*.
-    MppFaucetError:
-        When the devnet/testnet airdrop fails after all retries.
-
-    Examples
-    --------
-    ::
-
-        # devnet (default) — zero config
-        client = await create_test_client()
-
-        # testnet
-        client = await create_test_client(TestClientConfig(network="testnet"))
-
-        # mainnet — must provide pre-funded wallet
-        client = await create_test_client(
-            TestClientConfig(network="mainnet", secret_key=my_64_byte_secret)
-        )
-
-        res = await client.fetch("http://localhost:3001/api/data")
     """
     from solders.keypair import Keypair  # noqa: PLC0415
 
@@ -485,7 +361,6 @@ async def create_test_client(config: TestClientConfig | None = None) -> TestClie
     network: SolanaNetwork = cfg.network
     rpc_url: str = cfg.rpc_url or NETWORK_RPC[network]
 
-    # Mainnet requires a pre-funded wallet
     if network == "mainnet" and cfg.secret_key is None:
         raise MppNetworkError(
             "mainnet",
@@ -494,13 +369,13 @@ async def create_test_client(config: TestClientConfig | None = None) -> TestClie
             "Pass your keypair's secret_key in the config.",
         )
 
-    # Build or restore keypair
     if cfg.secret_key is not None:
         keypair = Keypair.from_bytes(cfg.secret_key)
     else:
         keypair = Keypair()
 
     address: str = str(keypair.pubkey())
+    rpc = RpcClient(rpc_url, timeout=cfg.timeout)
 
     emit(
         PaymentStep(
@@ -510,9 +385,8 @@ async def create_test_client(config: TestClientConfig | None = None) -> TestClie
         )
     )
 
-    # Fund via airdrop on devnet/testnet; skip on mainnet
     if network in _AIRDROP_NETWORKS:
-        await _airdrop_with_retry(rpc_url, address)
+        await _airdrop_with_retry(rpc, address)
         emit(
             PaymentStep(
                 type="funded",
@@ -529,19 +403,20 @@ async def create_test_client(config: TestClientConfig | None = None) -> TestClie
             )
         )
 
+    http = httpx.AsyncClient(timeout=cfg.timeout)
     return TestClient(
         address=address,
         network=network,
         keypair=keypair,
-        rpc_url=rpc_url,
+        rpc=rpc,
+        http=http,
         on_step=emit,
         timeout=cfg.timeout,
     )
 
 
-# ─── mpp_fetch (shared lazy client) ──────────────────────────────────────────
-
 _shared_client: TestClient | None = None
+_shared_client_lock = asyncio.Lock()
 
 
 async def mpp_fetch(url: str, **kwargs: Any) -> httpx.Response:
@@ -549,48 +424,17 @@ async def mpp_fetch(url: str, **kwargs: Any) -> httpx.Response:
     Drop-in replacement for an async HTTP fetch with automatic Solana MPP payment.
 
     Uses a shared :class:`TestClient` lazily created on first call (devnet by
-    default).  Call :func:`mpp_fetch_reset` to discard the shared instance and
-    generate a new wallet on the next call.
-
-    Parameters
-    ----------
-    url:
-        The URL to fetch.
-    **kwargs:
-        Forwarded to :meth:`TestClient.fetch`.
-
-    Returns
-    -------
-    httpx.Response
-
-    Raises
-    ------
-    MppFaucetError:
-        When the devnet airdrop fails after retries.
-    MppTimeoutError:
-        When the full flow exceeds the timeout.
-
-    Examples
-    --------
-    ::
-
-        from mpp_test_sdk import mpp_fetch
-
-        res = await mpp_fetch("http://localhost:3001/api/data")
-        data = res.json()
+    default).  Call :func:`mpp_fetch_reset` to discard the shared instance.
     """
     global _shared_client
-    if _shared_client is None:
-        _shared_client = await create_test_client()
-    return await _shared_client.fetch(url, **kwargs)
+    async with _shared_client_lock:
+        if _shared_client is None:
+            _shared_client = await create_test_client()
+        client = _shared_client
+    return await client.fetch(url, **kwargs)
 
 
 def mpp_fetch_reset() -> None:
-    """
-    Discard the shared client.
-
-    The next call to :func:`mpp_fetch` will create a fresh wallet (and trigger
-    a new airdrop on devnet/testnet).
-    """
+    """Discard the shared client used by :func:`mpp_fetch`."""
     global _shared_client
     _shared_client = None
