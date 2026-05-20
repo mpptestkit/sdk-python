@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "mpp-test-sdk"
 version = "1.1.0"
-description = "Test pay-per-request APIs on Solana — devnet, testnet, or mainnet"
+description = "Test pay-per-request APIs on Solana -devnet, testnet, or mainnet"
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
