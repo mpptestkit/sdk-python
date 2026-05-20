@@ -1,5 +1,5 @@
 """
-mpp-test-sdk — Test pay-per-request APIs on Solana (devnet, testnet, or mainnet).
+mpp-test-sdk -Test pay-per-request APIs on Solana (devnet, testnet, or mainnet).
 
 Quick start::
 
@@ -30,13 +30,13 @@ Quick start::
 
 from ._client import (
     PaymentStep,
-    SolanaNetwork,
     TestClient,
     TestClientConfig,
     create_test_client,
     mpp_fetch,
     mpp_fetch_reset,
 )
+from ._rpc import LAMPORTS_PER_SOL, NETWORK_RPC, SolanaNetwork
 from ._server import MppServer, TestServerConfig, create_test_server
 from .errors import (
     MppError,

@@ -1,6 +1,6 @@
 # mpp-test-sdk (Python)
 
-Test pay-per-request APIs on Solana — devnet, testnet, or mainnet.
+Test pay-per-request APIs on Solana -devnet, testnet, or mainnet.
 
 ## Installation
 
