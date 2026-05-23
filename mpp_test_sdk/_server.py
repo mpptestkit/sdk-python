@@ -11,6 +11,8 @@ import functools
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from ._base_server import make_base_web3, random_evm_address, verify_base_payment
+from ._chain import BASE_NETWORK_RPC, BaseNetwork, ChainType
 from ._rpc import (
     LAMPORTS_PER_SOL,
     NETWORK_RPC,
@@ -32,21 +34,26 @@ class TestServerConfig:
 
     Attributes
     ----------
+    chain:
+        Blockchain for payments. ``"solana"`` (default) or ``"base"``.
     network:
         Solana network.  ``"devnet"`` (default), ``"testnet"``, or
         ``"mainnet"``.
     secret_key:
         64-byte server keypair secret.  Auto-generated if omitted.
+    base_network:
+        Base network when *chain* is ``"base"``. Default: ``"sepolia"``.
     recipient_address:
-        Override the recipient Solana address (base58).  Defaults to the
-        server keypair's public key.
+        Override the payment recipient address.
     rpc_url:
-        Override the Solana JSON-RPC endpoint.  Takes precedence over
-        *network*.
+        Override the JSON-RPC endpoint.  Takes precedence over *network* /
+        *base_network*.
     """
 
+    chain: ChainType = "solana"
     network: SolanaNetwork = "devnet"
     secret_key: bytes | None = None
+    base_network: BaseNetwork | None = None
     recipient_address: str | None = None
     rpc_url: str | None = None
 
@@ -118,10 +125,8 @@ async def _verify_payment(
 
 def _make_fastapi_dependency(
     *,
-    rpc: RpcClient,
-    recipient: str,
-    network: str,
-    required_sol: float,
+    server: MppServer,
+    required_amount: float,
     amount: str,
     payment_request_hdr: str,
 ) -> Callable:
@@ -137,13 +142,13 @@ def _make_fastapi_dependency(
         if not receipt_header:
             raise HTTPException(
                 status_code=402,
-                detail=_payment_required_detail(amount, recipient, network),
+                detail=server._payment_required_body(amount),
                 headers={"Payment-Request": payment_request_hdr},
             )
 
         try:
-            ok, err_msg = await _verify_payment(
-                rpc, receipt_header, recipient, required_sol
+            ok, err_msg = await server._verify_receipt(
+                receipt_header, required_amount, amount
             )
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(
@@ -167,21 +172,38 @@ class MppServer:
     def __init__(
         self,
         recipient_address: str,
-        network: SolanaNetwork,
-        rpc: RpcClient,
+        network: str,
+        *,
+        chain: ChainType = "solana",
+        rpc: RpcClient | None = None,
+        w3: Any | None = None,
     ) -> None:
         self.recipient_address: str = recipient_address
-        self.network: SolanaNetwork = network
+        self.network: str = network
+        self.chain: ChainType = chain
         self._rpc = rpc
+        self._w3 = w3
 
     def _payment_request_header(self, amount: str) -> str:
+        scheme = "base" if self.chain == "base" else "solana"
         return (
-            f'solana; amount="{amount}"; '
+            f'{scheme}; amount="{amount}"; '
             f'recipient="{self.recipient_address}"; '
             f'network="{self.network}"'
         )
 
     def _payment_required_body(self, amount: str) -> dict[str, Any]:
+        if self.chain == "base":
+            return {
+                "error": "Payment Required",
+                "payment": {
+                    "amount": amount,
+                    "currency": "ETH",
+                    "recipient": self.recipient_address,
+                    "network": self.network,
+                    "chain": "base",
+                },
+            }
         return {
             "error": "Payment Required",
             "payment": {
@@ -189,14 +211,35 @@ class MppServer:
                 "currency": "SOL",
                 "recipient": self.recipient_address,
                 "network": self.network,
+                "chain": "solana",
             },
         }
 
+    async def _verify_receipt(
+        self, receipt_header: str, required_amount: float, amount: str
+    ) -> tuple[bool, str]:
+        if self.chain == "base":
+            assert self._w3 is not None
+            return await verify_base_payment(
+                self._w3,
+                receipt_header,
+                self.recipient_address,
+                required_amount,
+                amount,
+            )
+        assert self._rpc is not None
+        return await _verify_payment(
+            self._rpc,
+            receipt_header,
+            self.recipient_address,
+            required_amount,
+        )
+
     def flask_charge(self, amount: str) -> Callable:
         """
-        Flask decorator that enforces SOL payment before the route handler runs.
+        Flask decorator that enforces on-chain payment before the route handler runs.
         """
-        required_sol = float(amount)
+        required_amount = float(amount)
 
         def decorator(fn: Callable) -> Callable:
             @functools.wraps(fn)
@@ -215,12 +258,7 @@ class MppServer:
 
                 try:
                     ok, err_msg = asyncio.run(
-                        _verify_payment(
-                            self._rpc,
-                            receipt_header,
-                            self.recipient_address,
-                            required_sol,
-                        )
+                        self._verify_receipt(receipt_header, required_amount, amount)
                     )
                 except Exception as exc:  # noqa: BLE001
                     response = jsonify({"error": f"Payment verification failed: {exc}"})
@@ -241,15 +279,13 @@ class MppServer:
         return decorator
 
     def fastapi_charge(self, amount: str) -> Callable:
-        """FastAPI dependency that enforces SOL payment."""
-        required_sol = float(amount)
+        """FastAPI dependency that enforces on-chain payment."""
+        required_amount = float(amount)
         payment_request_hdr = self._payment_request_header(amount)
 
         return _make_fastapi_dependency(
-            rpc=self._rpc,
-            recipient=self.recipient_address,
-            network=self.network,
-            required_sol=required_sol,
+            server=self,
+            required_amount=required_amount,
             amount=amount,
             payment_request_hdr=payment_request_hdr,
         )
@@ -259,25 +295,23 @@ class MppServer:
         return self.fastapi_charge(amount)
 
 
-def _payment_required_detail(
-    amount: str, recipient: str, network: str
-) -> dict[str, Any]:
-    return {
-        "error": "Payment Required",
-        "payment": {
-            "amount": amount,
-            "currency": "SOL",
-            "recipient": recipient,
-            "network": network,
-        },
-    }
-
-
 def create_test_server(config: TestServerConfig | None = None) -> MppServer:
-    """Create a Solana MPP-enabled server helper."""
+    """Create an MPP-enabled server helper for Solana or Base."""
+    cfg = config or TestServerConfig()
+
+    if cfg.chain == "base":
+        base_network: BaseNetwork = cfg.base_network or "sepolia"
+        rpc_url = cfg.rpc_url or BASE_NETWORK_RPC[base_network]
+        recipient = cfg.recipient_address or random_evm_address()
+        return MppServer(
+            recipient_address=recipient,
+            network=base_network,
+            chain="base",
+            w3=make_base_web3(rpc_url),
+        )
+
     from solders.keypair import Keypair  # noqa: PLC0415
 
-    cfg = config or TestServerConfig()
     network: SolanaNetwork = cfg.network
     rpc_url: str = cfg.rpc_url or NETWORK_RPC[network]
 
@@ -291,5 +325,6 @@ def create_test_server(config: TestServerConfig | None = None) -> MppServer:
     return MppServer(
         recipient_address=recipient_address,
         network=network,
+        chain="solana",
         rpc=RpcClient(rpc_url),
     )

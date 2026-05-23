@@ -16,6 +16,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+base = ["web3>=6.0.0"]
 flask = ["flask>=3.0.0"]
 fastapi = ["fastapi>=0.111.0", "starlette>=0.37.0"]
 dev = [

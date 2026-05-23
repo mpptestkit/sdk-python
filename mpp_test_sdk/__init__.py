@@ -36,6 +36,7 @@ from ._client import (
     mpp_fetch,
     mpp_fetch_reset,
 )
+from ._chain import BASE_NETWORK_RPC, BaseNetwork, ChainType
 from ._rpc import LAMPORTS_PER_SOL, NETWORK_RPC, SolanaNetwork
 from ._server import MppServer, TestServerConfig, create_test_server
 from .errors import (
@@ -57,6 +58,9 @@ __all__ = [
     "TestClientConfig",
     "PaymentStep",
     "SolanaNetwork",
+    "ChainType",
+    "BaseNetwork",
+    "BASE_NETWORK_RPC",
     # Server
     "create_test_server",
     "MppServer",

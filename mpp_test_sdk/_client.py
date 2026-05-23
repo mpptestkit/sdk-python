@@ -23,6 +23,7 @@ from typing import Any, Callable, Literal
 
 import httpx
 
+from ._chain import BaseNetwork, ChainType
 from ._rpc import (
     LAMPORTS_PER_SOL,
     NETWORK_RPC,
@@ -64,24 +65,33 @@ class TestClientConfig:
 
     Attributes
     ----------
+    chain:
+        Blockchain for payments. ``"solana"`` (default) or ``"base"``.
     network:
         Solana network. ``"devnet"`` (default) and ``"testnet"`` support free
         airdrops.  ``"mainnet"`` requires a pre-funded *secret_key*.
     secret_key:
         32- or 64-byte keypair seed/secret.  On devnet/testnet this is optional
         (airdrop is used).  On mainnet it is **required**.
+    base_network:
+        Base network when *chain* is ``"base"``. Default: ``"sepolia"``.
+    private_key:
+        Hex-encoded secp256k1 key for Base payments.
     on_step:
         Callback invoked with each :class:`PaymentStep` lifecycle event.
     timeout:
         Full-flow timeout in seconds (wallet creation + payment + retry).
         Default: 30.0.
     rpc_url:
-        Override the Solana JSON-RPC endpoint.  Takes precedence over
-        *network*.
+        Override the JSON-RPC endpoint.  Takes precedence over *network* /
+        *base_network*.
     """
 
+    chain: ChainType = "solana"
     network: SolanaNetwork = "devnet"
     secret_key: bytes | None = None
+    base_network: BaseNetwork | None = None
+    private_key: str | None = None
     on_step: Callable[[PaymentStep], None] | None = None
     timeout: float = 30.0
     rpc_url: str | None = None
@@ -346,17 +356,22 @@ async def _airdrop_with_retry(
     raise MppFaucetError(pubkey_str, last_exc)
 
 
-async def create_test_client(config: TestClientConfig | None = None) -> TestClient:
+async def create_test_client(
+    config: TestClientConfig | None = None,
+) -> TestClient | "BaseTestClient":
     """
-    Create a Solana MPP test client.
+    Create an MPP test client for Solana or Base.
 
-    Automatically creates a Solana wallet, funds it (via airdrop on
-    devnet/testnet), and returns a :class:`TestClient` whose
+    Automatically creates a wallet and returns a client whose
     :meth:`~TestClient.fetch` method handles HTTP 402 MPP payments.
     """
-    from solders.keypair import Keypair  # noqa: PLC0415
-
     cfg = config or TestClientConfig()
+    if cfg.chain == "base":
+        from ._base_client import create_base_test_client  # noqa: PLC0415
+
+        return await create_base_test_client(cfg)
+
+    from solders.keypair import Keypair  # noqa: PLC0415
     emit: Callable[[PaymentStep], None] = cfg.on_step or (lambda _: None)
     network: SolanaNetwork = cfg.network
     rpc_url: str = cfg.rpc_url or NETWORK_RPC[network]
